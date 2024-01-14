@@ -7,15 +7,13 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	clientID       = ""
-	clientSecret   = ""
-	refreshToken   = ""
 	refreshTimeout = 45 * time.Minute
 	updateInterval = 5 * time.Second
 )
@@ -44,6 +42,10 @@ func main() {
 		log.Printf("Error getting access token: %v", err)
 
 	}
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 
 	go func() {
 		for {
@@ -70,7 +72,7 @@ func main() {
 		}
 	}(exitChan)
 
-	http.HandleFunc("/current-track", func(w http.ResponseWriter, _ *http.Request) {
+	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -89,7 +91,7 @@ func main() {
 		}
 	})
 
-	err = http.ListenAndServe("localhost:8080", nil)
+	err = http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatalf("Error starting the server: %v", err)
 		return
@@ -107,7 +109,10 @@ type AccessTokenResponse struct {
 
 func refreshAccessToken() (string, error) {
 	tokenURL := "https://accounts.spotify.com/api/token"
-
+	refreshToken := os.Getenv("REFRESH_TOKEN")
+	if refreshToken == "" {
+		return "", fmt.Errorf("no refresh token given")
+	}
 	data := url.Values{}
 	data.Set("grant_type", "refresh_token")
 	data.Set("refresh_token", refreshToken)
@@ -116,8 +121,16 @@ func refreshAccessToken() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("error creating request: %v", err)
 	}
+	clientID := os.Getenv("CLIENT_ID")
+	clientSecret, err := os.ReadFile(".client_secret")
+	if err != nil {
+		return "", fmt.Errorf("error reading client_secret")
+	}
+	if clientID == "" {
 
-	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(clientID+":"+clientSecret)))
+		return "", fmt.Errorf("$CLIENT_ID is not set")
+	}
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(clientID+":"+string(clientSecret))))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	client := &http.Client{}
