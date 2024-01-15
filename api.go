@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-
+	"github.com/rs/cors"
 	"github.com/gorilla/websocket"
 )
 
@@ -94,8 +94,9 @@ func main() {
 			}
 		}
 	}(exitChan)
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -116,8 +117,8 @@ func main() {
 			return
 		}
 	})
-
-	err = http.ListenAndServe(":"+port, nil)
+	handler := cors.Default().Handler(mux)
+	err = http.ListenAndServe(":"+port, handler)
 	if err != nil {
 		log.Fatalf("Error starting the server: %v", err)
 		return
