@@ -307,7 +307,8 @@ func sendTrack(conn *websocket.Conn, track TrackInfo) {
 
 	err = conn.WriteMessage(websocket.TextMessage, trackJSON)
 	if err != nil {
-		log.Printf("Error writing to WebSocket: %v", err)
+		delete(connections, conn)
+		conn.Close()
 		return
 	}
 }
