@@ -21,12 +21,12 @@ const (
 )
 
 var (
-	mu           sync.Mutex
-	currentTrack TrackInfo
+	mu            sync.Mutex
+	currentTrack  TrackInfo
 	previousTrack TrackInfo
-	exitChan     = make(chan struct{})
+	exitChan      = make(chan struct{})
 	connections   = make(map[*websocket.Conn]struct{})
-	upgrader     = websocket.Upgrader{
+	upgrader      = websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 		CheckOrigin: func(r *http.Request) bool {
@@ -43,11 +43,14 @@ type TrackInfo struct {
 	Link       string `json:"external_url"`
 	IsPlaying  bool   `json:"is_playing"`
 	AlbumImage string `json:"album_image"`
+	Duration   int    `json:"duration"`
+	Progress   int    `json:"progress"`
 }
 
 func main() {
 	var err error
 	var accessToken string
+
 	accessToken, err = refreshAccessToken()
 	if err != nil {
 		log.Printf("Error getting access token: %v", err)
@@ -74,43 +77,40 @@ func main() {
 			case <-exitChan:
 				return
 			default:
-				currentTrack, err = getCurrentTrack(accessToken)
-				if err != nil {
-					log.Printf("Error getting current track: %v", err)
+				if len(connections) > 0 {
+					currentTrack, err = getCurrentTrack(accessToken)
+					if err != nil {
+						log.Printf("Error getting current track: %v", err)
+					}
+
+					if currentTrack.ID != previousTrack.ID {
+						previousTrack = currentTrack
+
+						broadcastTrack(currentTrack)
+					}
+
+					time.Sleep(updateInterval)
 				}
-
-				
-				// Check if the current track is different from the previous one
-				if currentTrack.ID != previousTrack.ID {
-					// Update previousTrack with the newTrack
-					previousTrack = currentTrack
-
-					// Broadcast the new track to all connected WebSocket clients
-					broadcastTrack(currentTrack)
-				}
-
-				time.Sleep(updateInterval)
 			}
 		}
 	}(exitChan)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Upgrade the connection to WebSocket
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Printf("Error upgrading to WebSocket: %v", err)
 			return
 		}
 
-		// Add the new connection to the map
 		mu.Lock()
 		connections[conn] = struct{}{}
 		mu.Unlock()
+		currentTrack, err = getCurrentTrack(accessToken)
+		if currentTrack.ID != previousTrack.ID {
+			previousTrack = currentTrack
+		}
 
-		// Send the current track to the new WebSocket client
 		sendTrack(conn, currentTrack)
-		log.Printf("WebSocket connection opened")
-		// Keep the connection open
+
 		select {
 		case <-exitChan:
 			return
@@ -244,6 +244,17 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 		return TrackInfo{}, fmt.Errorf("no album images in the response")
 	}
 
+	progress, ok := playerResponse["progress_ms"]
+	if !ok{
+		return TrackInfo{}, fmt.Errorf("no progress_ms in the response")
+	}
+
+	duration, ok := track["duration_ms"]
+	if !ok{
+		return TrackInfo{}, fmt.Errorf("no duration_ms in the response")
+	}
+
+
 	var albumImageURL string
 	if len(images) > 0 {
 		albumImageURL, ok = images[0].(map[string]interface{})["url"].(string)
@@ -260,6 +271,8 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 		IsPlaying:  isPlaying,
 		AlbumImage: albumImageURL,
 		AlbumName:  albumName,
+		Duration:   int(duration.(float64)),
+		Progress:   int(progress.(float64)),
 	}, nil
 }
 
@@ -267,22 +280,15 @@ func broadcastTrack(track TrackInfo) {
 	mu.Lock()
 	defer mu.Unlock()
 
-
-
-
-
 	messageJSON, err := json.Marshal(track)
 	if err != nil {
 		log.Printf("Error encoding WebSocket message: %v", err)
 		return
 	}
 
-	// Send the message to all connected WebSocket clients
 	for conn := range connections {
 		err := conn.WriteMessage(websocket.TextMessage, messageJSON)
 		if err != nil {
-			log.Printf("Error writing to WebSocket: %v", err)
-			// Remove the connection if there's an error
 			delete(connections, conn)
 			conn.Close()
 		}
@@ -293,14 +299,12 @@ func sendTrack(conn *websocket.Conn, track TrackInfo) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Encode the track to JSON
 	trackJSON, err := json.Marshal(track)
 	if err != nil {
 		log.Printf("Error encoding JSON: %v", err)
 		return
 	}
 
-	// Send the track to the specific WebSocket client
 	err = conn.WriteMessage(websocket.TextMessage, trackJSON)
 	if err != nil {
 		log.Printf("Error writing to WebSocket: %v", err)
