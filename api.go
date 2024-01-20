@@ -11,8 +11,10 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"github.com/rs/cors"
+
 	"github.com/gorilla/websocket"
+	"github.com/iancoleman/orderedmap"
+	"github.com/rs/cors"
 )
 
 const (
@@ -36,15 +38,16 @@ var (
 )
 
 type TrackInfo struct {
-	ID         string `json:"id"`
-	AlbumName  string `json:"album_name"`
-	TrackName  string `json:"name"`
-	Artists    string `json:"artists"`
-	Link       string `json:"external_url"`
-	IsPlaying  bool   `json:"is_playing"`
-	AlbumImage string `json:"album_image"`
-	Duration   int    `json:"duration"`
-	Progress   int    `json:"progress"`
+	ID         string                 `json:"id"`
+	AlbumName  string                 `json:"album_name"`
+	TrackName  string                 `json:"name"`
+	Artists    *orderedmap.OrderedMap `json:"artists"`
+	Link       string                 `json:"song_url"`
+	IsPlaying  bool                   `json:"is_playing"`
+	AlbumImage string                 `json:"album_image"`
+	AlbumURL   string                 `json:"album_url"`
+	Duration   int                    `json:"duration"`
+	Progress   int                    `json:"progress"`
 }
 
 func main() {
@@ -95,7 +98,7 @@ func main() {
 		}
 	}(exitChan)
 	mux := http.NewServeMux()
-	
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -112,10 +115,7 @@ func main() {
 
 		sendTrack(conn, currentTrack)
 
-		select {
-		case <-exitChan:
-			return
-		}
+		<-exitChan
 	})
 	handler := cors.Default().Handler(mux)
 	err = http.ListenAndServe(":"+port, handler)
@@ -221,13 +221,18 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 		return TrackInfo{}, fmt.Errorf("no artist information in the response")
 	}
 
-	artistNames := make([]string, len(artists))
-	for i, artist := range artists {
-		artistMap, ok := artist.(map[string]interface{})
+	artistMap := orderedmap.New()
+	for _, artist := range artists {
+		artistInfo, ok := artist.(map[string]interface{})
 		if !ok {
 			return TrackInfo{}, fmt.Errorf("invalid artist information in the response")
 		}
-		artistNames[i] = artistMap["name"].(string)
+		name := artistInfo["name"].(string)
+		externalURL, ok := artistInfo["external_urls"].(map[string]interface{})["spotify"].(string)
+		if !ok {
+			return TrackInfo{}, fmt.Errorf("no external URL for artist %s in the response", name)
+		}
+		artistMap.Set(name, externalURL)
 	}
 
 	album, ok := track["album"].(map[string]interface{})
@@ -246,15 +251,14 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 	}
 
 	progress, ok := playerResponse["progress_ms"]
-	if !ok{
+	if !ok {
 		return TrackInfo{}, fmt.Errorf("no progress_ms in the response")
 	}
 
 	duration, ok := track["duration_ms"]
-	if !ok{
+	if !ok {
 		return TrackInfo{}, fmt.Errorf("no duration_ms in the response")
 	}
-
 
 	var albumImageURL string
 	if len(images) > 0 {
@@ -267,11 +271,12 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 	return TrackInfo{
 		ID:         track["id"].(string),
 		TrackName:  track["name"].(string),
-		Artists:    strings.Join(artistNames, ", "),
+		Artists:    artistMap,
 		Link:       track["external_urls"].(map[string]interface{})["spotify"].(string),
 		IsPlaying:  isPlaying,
 		AlbumImage: albumImageURL,
 		AlbumName:  albumName,
+		AlbumURL:   album["external_urls"].(map[string]interface{})["spotify"].(string),
 		Duration:   int(duration.(float64)),
 		Progress:   int(progress.(float64)),
 	}, nil
