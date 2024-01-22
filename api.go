@@ -117,7 +117,12 @@ func main() {
 
 		<-exitChan
 	})
-	handler := cors.Default().Handler(mux)
+	c := c := cors.New(cors.Options{
+    AllowedOrigins: []string{"http://pablolafontaine.com"},
+    AllowCredentials: false,
+    Debug: false,
+})
+	handler := c.Handler(mux)
 	err = http.ListenAndServe(":"+port, handler)
 	if err != nil {
 		log.Fatalf("Error starting the server: %v", err)
