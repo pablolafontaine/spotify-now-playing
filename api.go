@@ -11,37 +11,54 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/iancoleman/orderedmap"
+	"github.com/rs/cors"
 )
 
 const (
 	refreshTimeout = 45 * time.Minute
-	updateInterval = 5 * time.Second
+	updateInterval = time.Second
 )
 
 var (
-	mu           sync.Mutex
-	currentTrack TrackInfo
-	exitChan     = make(chan struct{}) // Channel to signal goroutine exit
+	mu            sync.Mutex
+	currentTrack  TrackInfo
+	previousTrack TrackInfo
+	exitChan      = make(chan struct{})
+	connections   = make(map[*websocket.Conn]struct{})
+	upgrader      = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
 )
 
 type TrackInfo struct {
-	ID         string `json:"id"`
-	AlbumName  string `json:"album_name"`
-	TrackName  string `json:"name"`
-	Artists    string `json:"artists"`
-	Link       string `json:"external_url"`
-	IsPlaying  bool   `json:"is_playing"`
-	AlbumImage string `json:"album_image"`
+	ID         string                 `json:"id"`
+	AlbumName  string                 `json:"album_name"`
+	TrackName  string                 `json:"name"`
+	Artists    *orderedmap.OrderedMap `json:"artists"`
+	Link       string                 `json:"song_url"`
+	IsPlaying  bool                   `json:"is_playing"`
+	AlbumImage string                 `json:"album_image"`
+	AlbumURL   string                 `json:"album_url"`
+	Duration   int                    `json:"duration"`
+	Progress   int                    `json:"progress"`
 }
 
 func main() {
 	var err error
 	var accessToken string
+
 	accessToken, err = refreshAccessToken()
 	if err != nil {
 		log.Printf("Error getting access token: %v", err)
-
 	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -63,36 +80,53 @@ func main() {
 			case <-exitChan:
 				return
 			default:
-				currentTrack, err = getCurrentTrack(accessToken)
+				if len(connections) > 0 {
+					currentTrack, err = getCurrentTrack(accessToken)
+					if err != nil {
+						log.Printf("Error getting current track: %v", err)
+					}
 
-				if err != nil {
-					log.Printf("Error getting current track: %v", err)
+					if currentTrack.ID != previousTrack.ID {
+						previousTrack = currentTrack
+
+						broadcastTrack(currentTrack)
+					}
+
+					time.Sleep(updateInterval)
 				}
-				time.Sleep(updateInterval)
 			}
 		}
 	}(exitChan)
+	mux := http.NewServeMux()
 
-	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		if currentTrack.ID == "" {
-			http.Error(w, "No track currently playing", http.StatusNotFound)
-			return
-		}
-
-		// Return the currently playing track as JSON
-		w.Header().Set("Content-Type", "application/json")
-		err = json.NewEncoder(w).Encode(currentTrack)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Printf("Error encoding JSON: %v", err)
-			http.Error(w, "Error encoding JSON", http.StatusInternalServerError)
 			return
 		}
-	})
 
-	err = http.ListenAndServe(":"+port, nil)
+		mu.Lock()
+		connections[conn] = struct{}{}
+		mu.Unlock()
+		currentTrack, err = getCurrentTrack(accessToken)
+		if err != nil {
+			log.Fatalf("failed to get current track!")
+		}
+		if currentTrack.ID != previousTrack.ID {
+			previousTrack = currentTrack
+		}
+
+		sendTrack(conn, currentTrack)
+
+		<-exitChan
+	})
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"http://pablolafontaine.com"},
+		AllowCredentials: false,
+		Debug:            false,
+	})
+	handler := c.Handler(mux)
+	err = http.ListenAndServe(":"+port, handler)
 	if err != nil {
 		log.Fatalf("Error starting the server: %v", err)
 		return
@@ -170,12 +204,10 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != 204 {
-		return TrackInfo{}, fmt.Errorf("unexpected response status: %s", resp.Status)
-	}
-
 	if resp.StatusCode == 204 {
 		return TrackInfo{}, nil
+	} else if resp.StatusCode != http.StatusOK {
+		return TrackInfo{}, fmt.Errorf("unexpected response status: %s", resp.Status)
 	}
 
 	var playerResponse map[string]interface{}
@@ -199,13 +231,18 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 		return TrackInfo{}, fmt.Errorf("no artist information in the response")
 	}
 
-	artistNames := make([]string, len(artists))
-	for i, artist := range artists {
-		artistMap, ok := artist.(map[string]interface{})
+	artistMap := orderedmap.New()
+	for _, artist := range artists {
+		artistInfo, ok := artist.(map[string]interface{})
 		if !ok {
 			return TrackInfo{}, fmt.Errorf("invalid artist information in the response")
 		}
-		artistNames[i] = artistMap["name"].(string)
+		name := artistInfo["name"].(string)
+		externalURL, ok := artistInfo["external_urls"].(map[string]interface{})["spotify"].(string)
+		if !ok {
+			return TrackInfo{}, fmt.Errorf("no external URL for artist %s in the response", name)
+		}
+		artistMap.Set(name, externalURL)
 	}
 
 	album, ok := track["album"].(map[string]interface{})
@@ -223,6 +260,16 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 		return TrackInfo{}, fmt.Errorf("no album images in the response")
 	}
 
+	progress, ok := playerResponse["progress_ms"]
+	if !ok {
+		return TrackInfo{}, fmt.Errorf("no progress_ms in the response")
+	}
+
+	duration, ok := track["duration_ms"]
+	if !ok {
+		return TrackInfo{}, fmt.Errorf("no duration_ms in the response")
+	}
+
 	var albumImageURL string
 	if len(images) > 0 {
 		albumImageURL, ok = images[0].(map[string]interface{})["url"].(string)
@@ -234,10 +281,50 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 	return TrackInfo{
 		ID:         track["id"].(string),
 		TrackName:  track["name"].(string),
-		Artists:    strings.Join(artistNames, ", "),
+		Artists:    artistMap,
 		Link:       track["external_urls"].(map[string]interface{})["spotify"].(string),
 		IsPlaying:  isPlaying,
 		AlbumImage: albumImageURL,
 		AlbumName:  albumName,
+		AlbumURL:   album["external_urls"].(map[string]interface{})["spotify"].(string),
+		Duration:   int(duration.(float64)),
+		Progress:   int(progress.(float64)),
 	}, nil
+}
+
+func broadcastTrack(track TrackInfo) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	messageJSON, err := json.Marshal(track)
+	if err != nil {
+		log.Printf("Error encoding WebSocket message: %v", err)
+		return
+	}
+
+	for conn := range connections {
+		err := conn.WriteMessage(websocket.TextMessage, messageJSON)
+		if err != nil {
+			delete(connections, conn)
+			conn.Close()
+		}
+	}
+}
+
+func sendTrack(conn *websocket.Conn, track TrackInfo) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	trackJSON, err := json.Marshal(track)
+	if err != nil {
+		log.Printf("Error encoding JSON: %v", err)
+		return
+	}
+
+	err = conn.WriteMessage(websocket.TextMessage, trackJSON)
+	if err != nil {
+		delete(connections, conn)
+		conn.Close()
+		return
+	}
 }
