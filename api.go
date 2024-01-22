@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -86,12 +87,12 @@ func main() {
 						log.Printf("Error getting current track: %v", err)
 					}
 
-					if currentTrack.ID != previousTrack.ID {
-						previousTrack = currentTrack
+					if currentTrack.ID != previousTrack.ID || math.Abs(float64(currentTrack.Progress-previousTrack.Progress)) > 1500 {
 
 						broadcastTrack(currentTrack)
 					}
 
+					previousTrack = currentTrack
 					time.Sleep(updateInterval)
 				}
 			}
