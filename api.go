@@ -109,6 +109,9 @@ func main() {
 		connections[conn] = struct{}{}
 		mu.Unlock()
 		currentTrack, err = getCurrentTrack(accessToken)
+		if err != nil {
+			log.Fatalf("failed to get current track!")
+		}
 		if currentTrack.ID != previousTrack.ID {
 			previousTrack = currentTrack
 		}
@@ -117,11 +120,11 @@ func main() {
 
 		<-exitChan
 	})
-	c := c := cors.New(cors.Options{
-    AllowedOrigins: []string{"http://pablolafontaine.com"},
-    AllowCredentials: false,
-    Debug: false,
-})
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"http://pablolafontaine.com"},
+		AllowCredentials: false,
+		Debug:            false,
+	})
 	handler := c.Handler(mux)
 	err = http.ListenAndServe(":"+port, handler)
 	if err != nil {
