@@ -112,7 +112,7 @@ func main() {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		conn, upgraderErr := upgrader.Upgrade(w, r, nil)
 		if upgraderErr != nil {
-			log.Printf("Error upgrading connection: %v", err)
+			log.Printf("Error upgrading connection: %v", upgraderErr)
 			return
 		}
 
