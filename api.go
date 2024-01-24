@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -65,20 +66,28 @@ func main() {
 		port = "8080"
 	}
 
-	go func() {
-		for {
-			time.Sleep(refreshTimeout)
-			accessToken, err = refreshAccessToken()
-			if err != nil {
-				log.Printf("Error getting access token: %v", err)
-			}
-		}
-	}()
 
-	go func(exitChan <-chan struct{}) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() 
+
+	go func(ctx context.Context) {
 		for {
 			select {
-			case <-exitChan:
+			case <-ctx.Done():
+				return
+			case <-time.After(refreshTimeout):
+				accessToken, err = refreshAccessToken()
+				if err != nil {
+					log.Printf("Error getting access token: %v", err)
+				}
+			}
+		}
+	}(ctx)
+
+	go func(ctx context.Context) {
+		for {
+			select {
+			case <-ctx.Done():
 				return
 			default:
 				if len(connections) > 0 {
@@ -88,7 +97,6 @@ func main() {
 					}
 
 					if currentTrack.ID != previousTrack.ID || math.Abs(float64(currentTrack.Progress-previousTrack.Progress)) > 1500 {
-
 						broadcastTrack(currentTrack)
 					}
 
@@ -97,12 +105,14 @@ func main() {
 				}
 			}
 		}
-	}(exitChan)
+	}(ctx)
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, upgraderErr := upgrader.Upgrade(w, r, nil)
+		if upgraderErr != nil {
+			log.Printf("Error upgrading connection: %v", err)
 			return
 		}
 
@@ -111,7 +121,7 @@ func main() {
 		mu.Unlock()
 		currentTrack, err = getCurrentTrack(accessToken)
 		if err != nil {
-			log.Fatalf("failed to get current track!")
+			log.Printf("Failed to get current track: %v", err)
 		}
 		if currentTrack.ID != previousTrack.ID {
 			previousTrack = currentTrack
@@ -119,20 +129,22 @@ func main() {
 
 		sendTrack(conn, currentTrack)
 
-		<-exitChan
+		<-ctx.Done()
 	})
+
 	c := cors.New(cors.Options{
 		AllowedOrigins:   []string{"http://pablolafontaine.com"},
 		AllowCredentials: false,
 		Debug:            false,
 	})
 	handler := c.Handler(mux)
+
 	err = http.ListenAndServe(":"+port, handler)
-	if err != nil {
-		log.Fatalf("Error starting the server: %v", err)
-		return
+	if err != nil && err != http.ErrServerClosed {
+		log.Printf("Error starting the server: %v", err)
 	}
 
+	log.Println("Shutting down gracefully...")
 	close(exitChan)
 }
 
@@ -217,61 +229,62 @@ func getCurrentTrack(accessToken string) (TrackInfo, error) {
 		return TrackInfo{}, fmt.Errorf("error decoding JSON response: %v", err)
 	}
 
-	isPlaying, ok := playerResponse["is_playing"].(bool)
-	if !ok || !isPlaying {
+	isPlaying, isPlayingOk := playerResponse["is_playing"].(bool)
+	if !isPlayingOk || !isPlaying {
 		return TrackInfo{}, nil
 	}
 
-	track, ok := playerResponse["item"].(map[string]interface{})
-	if !ok {
+	track, trackOk := playerResponse["item"].(map[string]interface{})
+	if !trackOk {
 		return TrackInfo{}, fmt.Errorf("no track information in the response")
 	}
 
-	artists, ok := track["artists"].([]interface{})
-	if !ok {
+	artists, artistsOk := track["artists"].([]interface{})
+	if !artistsOk {
 		return TrackInfo{}, fmt.Errorf("no artist information in the response")
 	}
 
 	artistMap := orderedmap.New()
 	for _, artist := range artists {
-		artistInfo, ok := artist.(map[string]interface{})
-		if !ok {
+		artistInfo, artistInfoOk := artist.(map[string]interface{})
+		if !artistInfoOk {
 			return TrackInfo{}, fmt.Errorf("invalid artist information in the response")
 		}
 		name := artistInfo["name"].(string)
-		externalURL, ok := artistInfo["external_urls"].(map[string]interface{})["spotify"].(string)
-		if !ok {
+		externalURL, externalUrlOk := artistInfo["external_urls"].(map[string]interface{})["spotify"].(string)
+		if !externalUrlOk {
 			return TrackInfo{}, fmt.Errorf("no external URL for artist %s in the response", name)
 		}
 		artistMap.Set(name, externalURL)
 	}
 
-	album, ok := track["album"].(map[string]interface{})
-	if !ok {
+	album, albumOk := track["album"].(map[string]interface{})
+	if !albumOk {
 		return TrackInfo{}, fmt.Errorf("no album information in the response")
 	}
 
-	albumName, ok := album["name"].(string)
-	if !ok {
+	albumName, albumNameOk := album["name"].(string)
+	if !albumNameOk {
 		return TrackInfo{}, fmt.Errorf("no album name in the response")
 	}
 
-	images, ok := album["images"].([]interface{})
-	if !ok {
+	images, imagesOk := album["images"].([]interface{})
+	if !imagesOk {
 		return TrackInfo{}, fmt.Errorf("no album images in the response")
 	}
 
-	progress, ok := playerResponse["progress_ms"]
-	if !ok {
+	progress, progressOk := playerResponse["progress_ms"]
+	if !progressOk {
 		return TrackInfo{}, fmt.Errorf("no progress_ms in the response")
 	}
 
-	duration, ok := track["duration_ms"]
-	if !ok {
+	duration, durationOk := track["duration_ms"]
+	if !durationOk {
 		return TrackInfo{}, fmt.Errorf("no duration_ms in the response")
 	}
 
 	var albumImageURL string
+	var ok bool
 	if len(images) > 0 {
 		albumImageURL, ok = images[0].(map[string]interface{})["url"].(string)
 		if !ok {
